@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include "rom_parser.h"
 #include "game_config.h"
+#include "m68k_decoder.h"
 
 typedef struct {
     uint32_t addr;
@@ -39,3 +40,13 @@ void function_list_free(FunctionList *list);
  * this to emit `jsr`/`bsr` to such a routine as a non-returning tail transfer
  * instead of falling through to the instruction after the call. */
 bool function_finder_pops_return_unconditionally(const GenesisRom *rom, uint32_t start);
+
+/* True if `call` is a JSR/BSR to a configured inline-data callee
+ * ([functions].inline_data_callees): the bytes after the call are a data block
+ * whose first word is its length in bytes (that word included), and the
+ * callee returns past it. Sets *cont to the address after the block. False
+ * (with a warning) when the length word is implausible. */
+bool function_finder_inline_data_continuation(const GenesisRom *rom,
+                                              const GameConfig *cfg,
+                                              const M68KInstr *call,
+                                              uint32_t *cont);

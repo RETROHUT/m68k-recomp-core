@@ -656,6 +656,27 @@ bool function_finder_pops_return_unconditionally(const GenesisRom *rom, uint32_t
     return m68k_return_capture_is_unconditional(rom, start);
 }
 
+bool function_finder_inline_data_continuation(const GenesisRom *rom,
+                                              const GameConfig *cfg,
+                                              const M68KInstr *call,
+                                              uint32_t *cont) {
+    if (!cfg || cfg->inline_data_callee_count == 0) return false;
+    if (!m68k_is_call(call) || !call->has_target) return false;
+    uint32_t fixed = 0;
+    if (!game_config_inline_data_size(cfg, call->target_addr, &fixed)) return false;
+    uint32_t data = call->addr + call->byte_length;
+    if (data + 2 > rom->rom_size) return false;
+    uint32_t len = fixed ? fixed : rom_read16(rom, data);
+    if (len < 2 || (len & 1) || data + len >= rom->rom_size) {
+        fprintf(stderr, "[FunctionFinder] WARN: inline-data call at $%06X -> $%06X "
+                "has implausible length word $%04X; decoding through it\n",
+                call->addr, call->target_addr, len);
+        return false;
+    }
+    *cont = data + len;
+    return true;
+}
+
 void function_finder_run(const GenesisRom *rom, FunctionList *list,
                          const GameConfig *cfg, const char *diagnostics_dir) {
     s_ff_cfg = cfg;
@@ -1007,6 +1028,14 @@ void function_finder_run(const GenesisRom *rom, FunctionList *list,
 
             prev_instr = instr;
             have_prev = true;
+            /* Inline-data callee: resume after the data block, not inside it. */
+            {
+                uint32_t cont;
+                if (function_finder_inline_data_continuation(rom, cfg, &instr, &cont)) {
+                    pc = cont;
+                    continue;
+                }
+            }
             pc += instr.byte_length;
         }
     }

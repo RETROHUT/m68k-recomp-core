@@ -1517,7 +1517,17 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
                 break;
 
             case MN_BSR:
-            case MN_JSR:
+            case MN_JSR: {
+                /* Inline-data callee: the call "returns" past the data block
+                 * after it. Continue the walk there (the emitter jumps to it)
+                 * and never decode the block as code. */
+                uint32_t inline_cont;
+                if (function_finder_inline_data_continuation(rom, cfg, &instr,
+                                                             &inline_cont)) {
+                    addrset_insert(&worklist, inline_cont);
+                    goto next_work;
+                }
+            }
                 /* FunctionFinder's linear walk stops at computed JMPs, while
                  * this CFG walk can prove and enter their case bodies. Close a
                  * direct call found there only with independent evidence:
@@ -1564,6 +1574,10 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
              instr.has_target && addrset_contains(instrs, instr.target_addr)) {
             addrset_insert(labels, instr.target_addr);
         }
+        uint32_t inline_cont;
+        if (function_finder_inline_data_continuation(rom, cfg, &instr, &inline_cont)
+                && addrset_contains(instrs, inline_cont))
+            addrset_insert(labels, inline_cont);
     }
 
     addrset_free(&worklist);
@@ -2291,6 +2305,9 @@ static void emit_mem_shift(FILE *f, const M68KInstr *instr,
     fprintf(f, "  }\n");
 }
 
+/* Config for inline-data call sites inside emit_instr (set per generation). */
+static const GameConfig *s_cfg_for_inline = NULL;
+
 static void emit_instr(FILE *f, const GenesisRom *rom,
                         const M68KInstr *instr,
                         const AddrSet *instrs,
@@ -2577,6 +2594,15 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * Doing our pop here would double-adjust A7 by +4. Skipping the
          * pop keeps A7 in sync with hardware. Consume one skipped return
          * slot; additional skipped slots continue through outer callers. */
+        /* The pending count is static (every long the callee popped past its
+         * own frame, MOVEM included), so it can overshoot: a handler that
+         * discards its return address AND its parent's saved registers
+         * (`addq #4,sp; movem.l (sp)+,...; rts`) counts 1+N slots but only
+         * returns from its parent. The stack says where the RTS really goes:
+         * if A7 is back at this call's slot, the RTS pops this slot, so this
+         * is the frame it returns to. Stop unwinding here. */
+        fprintf(f, "  if (g_rte_pending && ((g_cpu.A[7] ^ _jsr_slot_sp_%06X) & 0xFFFFFFu) == 0)\n"
+                   "    g_rte_pending = 0; /* RTS lands in this frame */\n", addr);
         fprintf(f, "  if (g_rte_pending) { --g_rte_pending;\n");
         emit_cycle_accounting(f, "    ", estimate_cycles(instr));
         fprintf(f, "    return; } /* RTE/skip propagation (pre-pop) */\n");
@@ -2586,6 +2612,20 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 "  else\n"
                 "    ; /* nested skip-return already consumed this slot */\n",
                 addr);
+        /* Inline-data callee: execution resumes after the data block that
+         * follows the call (the callee moved its return address there). */
+        {
+            uint32_t inline_cont;
+            if (function_finder_inline_data_continuation(rom, s_cfg_for_inline, instr,
+                                                         &inline_cont)) {
+                emit_cycle_accounting(f, "  ", estimate_cycles(instr));
+                if (addrset_contains(instrs, inline_cont))
+                    fprintf(f, "  goto label_%06X; /* past inline data */\n", inline_cont);
+                else
+                    emit_split_tail_call(f, "  ", inline_cont, *has_sp_adjust != 0, -1);
+                *skip_until_label = true;
+            }
+        }
         break;
     }
 
@@ -4559,6 +4599,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     s_candidate_owner_count = 0;
     s_extra_seeds      = cfg ? cfg->extra_seeds      : NULL;
     s_extra_seed_count = cfg ? cfg->extra_seed_count : 0;
+    s_cfg_for_inline = cfg;
     s_ws_sites      = cfg ? cfg->ws_sites      : NULL;
     s_ws_site_count = cfg ? cfg->ws_site_count : 0;
     if (s_ws_site_count)
