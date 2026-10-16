@@ -1148,6 +1148,19 @@ static bool pea_const_addr(const M68KInstr *instr, uint32_t *out) {
     return true;
 }
 
+/* Does an unconditional transfer (RTS, RTE, JMP, BRA) end exactly at addr?
+ * Tries the instruction lengths those take, 2 to 6 bytes back. */
+static bool follows_unconditional_transfer(const GenesisRom *rom, uint32_t addr) {
+    for (uint32_t back = 2; back <= 6 && back <= addr; back += 2) {
+        M68KInstr p;
+        if (!m68k_decode(rom, addr - back, &p) || p.byte_length != back) continue;
+        if (p.mnemonic == MN_RTS || p.mnemonic == MN_RTE || p.mnemonic == MN_JMP ||
+                p.mnemonic == MN_BRA)
+            return true;
+    }
+    return false;
+}
+
 /* =========================================================================
  * scan_function — discover all instruction addresses and branch-target labels
  * ========================================================================= */
@@ -1549,15 +1562,19 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
             /* `pea ret` of an address inside this function's own range: the
              * code there may be reached only through that pushed return
              * (NHL 96's $016BAA PEA $016BCA; RTS), so walk it as well. */
-            /* A PEA followed by a call is an argument (`pea msg(pc); jsr
-             * print`), often pointing at data: leave those alone. */
+            /* A PEA followed by a call is usually an argument (`pea msg(pc);
+             * jsr print`), often pointing at data: leave those alone, unless
+             * the target sits right after an unconditional transfer, as code
+             * reached only through a pushed return does (NHL 96's $015202
+             * PEA $015260 is followed by JSR $022E92; $015260 comes right
+             * after the JMP (A0) that goes through its jump table). */
             {
                 uint32_t pea_ret;
                 M68KInstr after;
                 if (pea_const_addr(&instr, &pea_ret) &&
                         pea_ret > start_addr && pea_ret < next_func_start &&
                         m68k_decode(rom, pc + instr.byte_length, &after) &&
-                        !m68k_is_call(&after))
+                        (!m68k_is_call(&after) || follows_unconditional_transfer(rom, pea_ret)))
                     addrset_insert(&worklist, pea_ret);
             }
 
