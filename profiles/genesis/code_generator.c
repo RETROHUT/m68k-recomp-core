@@ -1039,10 +1039,57 @@ static void emit_cycle_accounting(FILE *f, const char *indent, int cycles)
     fprintf(f, "%sGEN_COSIM_TICK(%d);\n", indent, cycles);
 }
 
+/* Functions that push a constant code address with PEA and later reach it
+ * through an RTS: `pea ret; rts` (a jump), or `pea ret; ...; bra/jmp target`
+ * where target's RTS pops ret (a call). NHL 96 does both ($01B74C, $016BAA,
+ * $016BB4). A generated RTS is a C return and a branch out is a tail call, so
+ * both left the function and skipped the code at ret (a MOVEM restore),
+ * leaving the caller's stack off by the frame. Such functions keep the
+ * pushed slot in _pea_sp/_pea_ret: an RTS that would pop it, or a transfer
+ * out that returns with it still on top, pops it and resumes at ret. */
+static bool s_fn_has_pea = false;
+
+static const char *pea_slot_live =
+    "_pea_sp && g_cpu.A[7] == _pea_sp && "
+    "(m68k_read32(g_cpu.A[7]) & 0xFFFFFFu) == _pea_ret";
+
+/* At an RTS: with the pushed slot on top, the RTS goes to ret. */
+static void emit_pea_rts_check(FILE *f, const char *ind, bool sp_adjust) {
+    if (!s_fn_has_pea) return;
+    fprintf(f, "%sif (%s) {\n", ind, pea_slot_live);
+    fprintf(f, "%s  g_cpu.A[7] += 4; _pea_sp = 0; /* RTS pops the pea'd return */\n", ind);
+    if (sp_adjust) fprintf(f, "%s  _sp_popped += 1;\n", ind);
+    fprintf(f, "%s  goto _pea_resume;\n%s}\n", ind, ind);
+}
+
+/* Before a transfer out of the function: with the pushed slot on top, the
+ * target's RTS returns to ret, so call the target and resume at ret. */
+static void emit_pea_call_check(FILE *f, const char *ind, const char *target_expr,
+                                bool sp_adjust) {
+    if (!s_fn_has_pea) return;
+    fprintf(f, "%sif (%s) {\n", ind, pea_slot_live);
+    fprintf(f, "%s  int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n", ind);
+    fprintf(f, "%s  recomp_call_addr(%s); /* its RTS pops the pea'd return */\n", ind, target_expr);
+    fprintf(f, "%s  g_split_sp_popped = _saved_split_sp_popped;\n", ind);
+    fprintf(f, "%s  if (g_rte_pending && ((g_cpu.A[7] ^ _pea_sp) & 0xFFFFFFu) == 0)\n", ind);
+    fprintf(f, "%s    g_rte_pending = 0; /* RTS lands in this frame */\n", ind);
+    fprintf(f, "%s  if (g_rte_pending) { --g_rte_pending; return; }\n", ind);
+    fprintf(f, "%s  if (g_cpu.A[7] != (uint32_t)(_pea_sp + 4u)) g_cpu.A[7] += 4;\n", ind);
+    fprintf(f, "%s  if (g_ret_arg_drop) { g_cpu.A[7] += g_ret_arg_drop; g_ret_arg_drop = 0; }\n", ind);
+    fprintf(f, "%s  _pea_sp = 0;\n", ind);
+    if (sp_adjust) fprintf(f, "%s  _sp_popped += 1;\n", ind);
+    fprintf(f, "%s  goto _pea_resume;\n%s}\n", ind, ind);
+}
+
 static void emit_split_tail_call(FILE *f, const char *indent,
                                  uint32_t target_addr, bool carry_sp_adjust,
                                  int cycles_before) {
     emit_cycle_accounting(f, indent, cycles_before);
+    if (s_fn_has_pea) {
+        char t[16];
+        snprintf(t, sizeof t, "0x%06Xu", target_addr);
+        emit_pea_call_check(f, indent, t, carry_sp_adjust);
+    }
     if (carry_sp_adjust) {
         fprintf(f, "%s{ g_split_sp_popped += _sp_popped; _sp_popped = 0;\n", indent);
         fprintf(f, "%s  recomp_tail_call(0x%06Xu);\n", indent, target_addr);
@@ -1058,6 +1105,7 @@ static void emit_split_tail_call_expr(FILE *f, const char *indent,
                                       bool carry_sp_adjust,
                                       int cycles_before) {
     emit_cycle_accounting(f, indent, cycles_before);
+    emit_pea_call_check(f, indent, addr_expr, carry_sp_adjust);
     if (carry_sp_adjust) {
         fprintf(f, "%s{ g_split_sp_popped += _sp_popped; _sp_popped = 0;\n", indent);
         fprintf(f, "%s  recomp_tail_call(%s);\n", indent, addr_expr);
@@ -1079,6 +1127,25 @@ static bool func_is_known(uint32_t addr) {
         else                              hi = mid - 1;
     }
     return false;
+}
+
+/* PEA of a constant code address: (xxx).W, (xxx).L or d16(PC). Games use it
+ * to call through a branch, `pea ret; ...; bra target`, where target's RTS
+ * pops ret (NHL 96's $01B74C: PEA $01B76C; TST.L; BEQ $01B3D8; ...;
+ * BRA $01AF00). Returns false for any other PEA. */
+static bool pea_const_addr(const M68KInstr *instr, uint32_t *out) {
+    if (instr->mnemonic != MN_PEA) return false;
+    int mode = (instr->src_ea >> 3) & 7, reg = instr->src_ea & 7;
+    if (mode != 7) return false;
+    uint32_t a;
+    if (reg == 0)      a = (uint32_t)(int32_t)(int16_t)instr->words[1];
+    else if (reg == 1) a = ((uint32_t)instr->words[1] << 16) | instr->words[2];
+    else if (reg == 2) a = instr->addr + 2u + (uint32_t)(int32_t)(int16_t)instr->words[1];
+    else return false;
+    a &= 0xFFFFFFu;
+    if (a & 1u) return false;
+    *out = a;
+    return true;
 }
 
 /* =========================================================================
@@ -1418,12 +1485,12 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
      * plausibly belong to THIS function (between start_addr and the next
      * function's start); cross-function seeds get filtered by the
      * `addr_belongs_to_other_function` check inside the walk anyway. */
+    uint32_t next_func_start = 0xFFFFFFFFu;
+    for (int i = 0; i < nfuncs; i++) {
+        if (sorted_funcs[i] > start_addr && sorted_funcs[i] < next_func_start)
+            next_func_start = sorted_funcs[i];
+    }
     if (extra_seeds && extra_seed_count > 0) {
-        uint32_t next_func_start = 0xFFFFFFFFu;
-        for (int i = 0; i < nfuncs; i++) {
-            if (sorted_funcs[i] > start_addr && sorted_funcs[i] < next_func_start)
-                next_func_start = sorted_funcs[i];
-        }
         for (int i = 0; i < extra_seed_count; i++) {
             uint32_t s = extra_seeds[i];
             if (s > start_addr && s < next_func_start)
@@ -1478,6 +1545,21 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
                                                    start_addr, all_entries, nentries);
 
             addrset_insert(instrs, pc);
+
+            /* `pea ret` of an address inside this function's own range: the
+             * code there may be reached only through that pushed return
+             * (NHL 96's $016BAA PEA $016BCA; RTS), so walk it as well. */
+            /* A PEA followed by a call is an argument (`pea msg(pc); jsr
+             * print`), often pointing at data: leave those alone. */
+            {
+                uint32_t pea_ret;
+                M68KInstr after;
+                if (pea_const_addr(&instr, &pea_ret) &&
+                        pea_ret > start_addr && pea_ret < next_func_start &&
+                        m68k_decode(rom, pc + instr.byte_length, &after) &&
+                        !m68k_is_call(&after))
+                    addrset_insert(&worklist, pea_ret);
+            }
 
             switch (instr.mnemonic) {
             case MN_RTS:
@@ -1578,6 +1660,10 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
         if (function_finder_inline_data_continuation(rom, cfg, &instr, &inline_cont)
                 && addrset_contains(instrs, inline_cont))
             addrset_insert(labels, inline_cont);
+        /* `pea ret; ...; bra target` resumes at ret (see emit_pea_call). */
+        uint32_t pea_ret;
+        if (pea_const_addr(&instr, &pea_ret) && addrset_contains(instrs, pea_ret))
+            addrset_insert(labels, pea_ret);
     }
 
     addrset_free(&worklist);
@@ -2308,6 +2394,7 @@ static void emit_mem_shift(FILE *f, const M68KInstr *instr,
 /* Config for inline-data call sites inside emit_instr (set per generation). */
 static const GameConfig *s_cfg_for_inline = NULL;
 
+
 static void emit_instr(FILE *f, const GenesisRom *rom,
                         const M68KInstr *instr,
                         const AddrSet *instrs,
@@ -2361,6 +2448,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
 
     /* ------------------------------------------------------------------ */
     case MN_RTS:
+        emit_pea_rts_check(f, "  ", *has_sp_adjust != 0);
         /* A stack skip can discard MORE than one return slot (SMPS's
          * stop-track command uses addq.w #8,sp). Carry the complete count
          * through the C callers; a boolean loses the second unwind and
@@ -2612,6 +2700,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 "  else\n"
                 "    ; /* nested skip-return already consumed this slot */\n",
                 addr);
+        fprintf(f, "  if (g_ret_arg_drop) { g_cpu.A[7] += g_ret_arg_drop; g_ret_arg_drop = 0; }"
+                   " /* callee dropped arguments */\n");
         /* Inline-data callee: execution resumes after the data block that
          * follows the call (the callee moved its return address there). */
         {
@@ -2644,6 +2734,24 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 emit_split_tail_call(f, "  ", instr->target_addr, *has_sp_adjust != 0,
                                      estimate_cycles(instr));
             }
+        } else if (mode == 2 && s_cfg_for_inline &&
+                   game_config_is_inline_data_callee(s_cfg_for_inline, func_addr) &&
+                   rom_read16(rom, func_addr) == (uint16_t)(0x205Fu | (reg << 9))) {
+            /* Inline-data callee that returns by jumping: it starts with
+             * MOVEA.L (SP)+,An (taking its own return slot), moves An past
+             * the data block and ends with JMP (An). That JMP is its return:
+             * every caller already resumes past the block, and the caller's
+             * JSR pop sees A7 one slot up and doesn't pop again. Only pops
+             * beyond that own slot are passed on as skip-returns. */
+            if (*has_sp_adjust) {
+                fprintf(f, "  if (_sp_popped > 1) { g_rte_pending = _sp_popped - 1; _sp_popped = 0; }\n");
+                fprintf(f, "  else if (g_split_sp_popped > 0) { g_rte_pending = g_split_sp_popped; g_split_sp_popped = 0; }\n");
+            } else {
+                fprintf(f, "  if (g_split_sp_popped > 0) { g_rte_pending = g_split_sp_popped; g_split_sp_popped = 0; }\n");
+            }
+            emit_cycle_accounting(f, "  ", estimate_cycles(instr));
+            fprintf(f, "  return; /* JMP (A%d): inline-data callee return */\n", reg);
+            *skip_until_label = true;
         } else if (mode == 2 || mode == 5 || mode == 6 ||
                    (mode == 7 && (reg == 0 || reg == 1))) {
             audit_record(instr->addr, func_addr, 0,
@@ -2916,6 +3024,22 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
 
     /* ------------------------------------------------------------------ */
     case MN_MOVE: {
+        /* `MOVE.L (SP)+,(SP); RTS`: the callee moves its return address up
+         * over a 4-byte argument, so its caller resumes with the argument
+         * gone (NHL 96's $01A4AE). A7 one slot up at the RTS would read as a
+         * skip-return to the caller's JSR wrapper, so keep A7 on the return
+         * slot and have the wrapper drop the argument (g_ret_arg_drop). */
+        if (instr->words[0] == 0x2E9Fu && addr + 2u < rom->rom_size &&
+                rom_read16(rom, addr + 2u) == 0x4E75u) {
+            fprintf(f, "  { uint32_t _rv = m68k_read32(g_cpu.A[7]);"
+                       " /* MOVE.L (SP)+,(SP) before RTS */\n"
+                       "    m68k_write32(g_cpu.A[7] + 4u, _rv);\n"
+                       "    g_cpu.SR &= ~(0x0Fu);\n"
+                       "    if (!_rv) g_cpu.SR |= (1u<<2);\n"
+                       "    if (_rv >> 31) g_cpu.SR |= (1u<<3); }\n");
+            fprintf(f, "  g_ret_arg_drop += 4u; /* caller drops the argument */\n");
+            break;
+        }
         /* words[1..]: src EA ext, then dst EA ext */
         int src_ea  = instr->src_ea;
         int dst_ea  = instr->dst_ea;
@@ -3006,6 +3130,11 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         fprintf(f, "  g_cpu.A[7] -= 4; m68k_write32(g_cpu.A[7], %s);\n", addr_expr);
         if (*has_sp_adjust)
             fprintf(f, "  _sp_popped -= 1; /* PEA pushes one longword */\n");
+        /* A constant code address may be a return the code pushes itself
+         * (`pea ret; ...; rts/bra/jmp`): remember the slot (s_fn_has_pea). */
+        uint32_t pea_ret;
+        if (s_fn_has_pea && pea_const_addr(instr, &pea_ret))
+            fprintf(f, "  _pea_sp = g_cpu.A[7]; _pea_ret = 0x%06Xu;\n", pea_ret);
         break;
     }
 
@@ -4989,6 +5118,25 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             fprintf(f_func, "  g_split_sp_popped = 0;\n");
         }
 
+        /* Constant PEAs: their return addresses resume at _pea_resume. */
+        uint32_t pea_rets[32];
+        int n_pea_rets = 0;
+        for (int k = 0; k < instrs.count; k++) {
+            M68KInstr pi;
+            uint32_t r;
+            if (m68k_decode(rom, instrs.addrs[k], &pi) && pea_const_addr(&pi, &r)) {
+                bool dup = false;
+                for (int q = 0; q < n_pea_rets; q++) dup |= pea_rets[q] == r;
+                if (!dup && n_pea_rets < 32) pea_rets[n_pea_rets++] = r;
+                else if (!dup)
+                    fprintf(stderr, "[codegen] WARN: func $%06X has more than 32 PEA "
+                            "returns; $%06X resumes through dispatch\n", func_addr, r);
+            }
+        }
+        s_fn_has_pea = n_pea_rets > 0;
+        if (s_fn_has_pea)
+            fprintf(f_func, "  uint32_t _pea_sp = 0, _pea_ret = 0;\n");
+
         /* TEMPORARY debug counters for VBla chain tracing */
         if (func_addr == 0x000B64)
             fprintf(f_func, "  g_dbg_b64_count++;\n");
@@ -5198,6 +5346,19 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                     }
                 }
             }
+        }
+
+        if (s_fn_has_pea) {
+            fprintf(f_func, "  return;\n_pea_resume:\n  switch (_pea_ret) {\n");
+            for (int q = 0; q < n_pea_rets; q++)
+                if (addrset_contains(&labels, pea_rets[q]))
+                    fprintf(f_func, "    case 0x%06Xu: goto label_%06X;\n",
+                            pea_rets[q], pea_rets[q]);
+            fprintf(f_func, "    default: break;\n  }\n");
+            if (has_sp_adjust)
+                fprintf(f_func, "  g_split_sp_popped += _sp_popped; _sp_popped = 0;\n");
+            fprintf(f_func, "  recomp_tail_call(_pea_ret); return;\n");
+            s_fn_has_pea = false;
         }
 
         fprintf(f_func, "}\n\n");
