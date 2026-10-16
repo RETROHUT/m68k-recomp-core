@@ -3460,9 +3460,14 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * does CLR.B SMPS_Track.VolEnvIndex(a5) inside FinishTrackUpdate,
          * silently zeroing the X flag set by the earlier subi.b in
          * PSGSetFreq — corrupting downstream Bcc paths that read X
-         * (squelched notes, drift). */
+         * (squelched notes, drift).
+         * CLR doesn't load its operand first, so the store is not the second
+         * half of a read-modify-write: CLR -(An) must decrement An here. With
+         * the RMW store it wrote 0 to the unmoved An: in NHL 96's number
+         * formatter $01BDE8, the CLR.B -(A1) at $01BE12 wiped every one-digit
+         * number (RETROHUT#69). */
         ExtReader er2; er_init(&er2, instr);
-        emit_ea_store_ex(f, instr, instr->src_ea, sz, &er2, "0", 1);
+        emit_ea_store(f, instr, instr->src_ea, sz, &er2, "0");
         fprintf(f, "  g_cpu.SR = (g_cpu.SR & ~0x0Fu) | (1u<<2);\n");
         break;
     }
