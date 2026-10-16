@@ -207,6 +207,12 @@ static int size_bytes(M68KSize sz) {
     }
 }
 
+/* How far (An)+ and -(An) move An. A byte access through A7 moves it by 2,
+ * so the stack stays word-aligned; any other access moves by the size. */
+static int an_step_bytes(int reg, M68KSize sz) {
+    return (reg == 7 && sz == M68K_SIZE_B) ? 2 : size_bytes(sz);
+}
+
 static const char *size_ctype(M68KSize sz) {
     switch (sz) {
     case M68K_SIZE_B: return "uint8_t";
@@ -403,7 +409,7 @@ static void emit_ea_load_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize sz
     int reg  = ea & 7;
     const char *ct = size_ctype(sz);
     const char *rf = size_read_fn(sz);
-    int sb = size_bytes(sz);
+    int step = an_step_bytes(reg, sz);
 
     switch (mode) {
     case 0: /* Dn */
@@ -423,13 +429,13 @@ static void emit_ea_load_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize sz
                     ct, tmp, rf, reg);
         } else {
             fprintf(f, "  %s %s = %s(g_cpu.A[%d]); g_cpu.A[%d] += %d;\n",
-                    ct, tmp, rf, reg, reg, sb);
+                    ct, tmp, rf, reg, reg, step);
         }
         snprintf(out_expr, 256, "%s", tmp);
         break;
     case 4: /* -(An) */
         fprintf(f, "  g_cpu.A[%d] -= %d; %s %s = %s(g_cpu.A[%d]);\n",
-                reg, sb, ct, tmp, rf, reg);
+                reg, step, ct, tmp, rf, reg);
         snprintf(out_expr, 256, "%s", tmp);
         break;
     case 5: { /* (d16,An) */
@@ -634,7 +640,7 @@ static void emit_ea_store_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize s
     const char *ct  = size_ctype(sz);
     const char *wf  = size_write_fn(sz);
     uint32_t    msk = size_mask(sz);
-    int         sb  = size_bytes(sz);
+    int         step = an_step_bytes(reg, sz);
     (void)instr;
 
     switch (mode) {
@@ -656,7 +662,7 @@ static void emit_ea_store_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize s
              * so the store does it. In non-RMW, the load already incremented
              * but the store gets a fresh er/address, so it also increments. */
         fprintf(f, "  %s(g_cpu.A[%d], (%s)(%s)); g_cpu.A[%d] += %d;\n",
-                wf, reg, ct, val_expr, reg, sb);
+                wf, reg, ct, val_expr, reg, step);
         break;
     case 4: /* -(An) */
         if (rmw) {
@@ -666,7 +672,7 @@ static void emit_ea_store_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize s
                     wf, reg, ct, val_expr);
         } else {
             fprintf(f, "  g_cpu.A[%d] -= %d; %s(g_cpu.A[%d], (%s)(%s));\n",
-                    reg, sb, wf, reg, ct, val_expr);
+                    reg, step, wf, reg, ct, val_expr);
         }
         break;
     case 5: { /* (d16,An) */
@@ -3404,14 +3410,12 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * Ax-source - Ay-source as a CMP, set flags, then advance both
          * address registers. X is unchanged (same as CMP).
          *
-         * 68K quirk: byte-size post-increment on A7 increments by 2
-         * to keep the supervisor stack aligned. CMPM (A7)+,(A7)+ is
-         * legal but rare. */
+         * Byte size on A7 increments by 2 (an_step_bytes). CMPM
+         * (A7)+,(A7)+ is legal but rare. */
         int ay = instr->src_ea & 7;             /* source register   */
         int ax = instr->reg;                    /* destination Ax    */
-        int sb = size_bytes(sz);
-        int ay_inc = (ay == 7 && sz == M68K_SIZE_B) ? 2 : sb;
-        int ax_inc = (ax == 7 && sz == M68K_SIZE_B) ? 2 : sb;
+        int ay_inc = an_step_bytes(ay, sz);
+        int ax_inc = an_step_bytes(ax, sz);
         const char *ct = size_ctype(sz);
         const char *rf = size_read_fn(sz);
         char res[64];
@@ -4335,8 +4339,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         int dst = instr->reg;
         int src = instr->src_ea & 7;
         if (instr->predec_mem_form) {
-            int ay_dec = (src == 7) ? 2 : 1;
-            int ax_dec = (dst == 7) ? 2 : 1;
+            int ay_dec = an_step_bytes(src, M68K_SIZE_B);
+            int ax_dec = an_step_bytes(dst, M68K_SIZE_B);
             fprintf(f,
                 "  { g_cpu.A[%d] -= %d;\n"
                 "    uint8_t _b = (uint8_t)m68k_read8(g_cpu.A[%d]);\n"
@@ -4396,8 +4400,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         int dst = instr->reg;
         int src = instr->src_ea & 7;
         if (instr->predec_mem_form) {
-            int ay_dec = (src == 7) ? 2 : 1;
-            int ax_dec = (dst == 7) ? 2 : 1;
+            int ay_dec = an_step_bytes(src, M68K_SIZE_B);
+            int ax_dec = an_step_bytes(dst, M68K_SIZE_B);
             fprintf(f,
                 "  { g_cpu.A[%d] -= %d;\n"
                 "    uint8_t _b = (uint8_t)m68k_read8(g_cpu.A[%d]);\n"
@@ -4518,11 +4522,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         uint32_t low_mask  = (bits == 32) ? 0xFFFFFFFFu : (bits == 16 ? 0xFFFFu : 0xFFu);
         if (instr->predec_mem_form) {
             /* -(Ay),-(Ax): predec both, read both, compute (Ax) + (Ay) + X,
-             * write back to (Ax). Byte size on A7 still increments by 2
+             * write back to (Ax). Byte size on A7 still decrements by 2
              * to keep the supervisor stack aligned. */
-            int sb = size_bytes(sz);
-            int ay_dec = (src == 7 && sz == M68K_SIZE_B) ? 2 : sb;
-            int ax_dec = (dst == 7 && sz == M68K_SIZE_B) ? 2 : sb;
+            int ay_dec = an_step_bytes(src, sz);
+            int ax_dec = an_step_bytes(dst, sz);
             const char *rf = size_read_fn(sz);
             const char *wf = size_write_fn(sz);
             const char *ct = size_ctype(sz);
@@ -4588,9 +4591,8 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         uint32_t sign_mask = (bits == 32) ? 0x80000000u : (bits == 16 ? 0x8000u : 0x80u);
         uint32_t low_mask  = (bits == 32) ? 0xFFFFFFFFu : (bits == 16 ? 0xFFFFu : 0xFFu);
         if (instr->predec_mem_form) {
-            int sb = size_bytes(sz);
-            int ay_dec = (src == 7 && sz == M68K_SIZE_B) ? 2 : sb;
-            int ax_dec = (dst == 7 && sz == M68K_SIZE_B) ? 2 : sb;
+            int ay_dec = an_step_bytes(src, sz);
+            int ax_dec = an_step_bytes(dst, sz);
             const char *rf = size_read_fn(sz);
             const char *wf = size_write_fn(sz);
             const char *ct = size_ctype(sz);
