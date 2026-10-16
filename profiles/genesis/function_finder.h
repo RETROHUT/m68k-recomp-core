@@ -41,6 +41,15 @@ void function_list_free(FunctionList *list);
  * instead of falling through to the instruction after the call. */
 bool function_finder_pops_return_unconditionally(const GenesisRom *rom, uint32_t start);
 
+/* True if `call` (a JSR/BSR with a static target) goes to such a routine and
+ * that routine really captures the return address. A call to an inline-data
+ * callee whose block resolves (function_finder_inline_data_continuation) is
+ * not one: the callee pops its return address only to read the block and
+ * resume past it (NHL 96's $01BE78, MOVEA.L (SP)+,A1). */
+bool function_finder_call_captures_return(const GenesisRom *rom,
+                                          const GameConfig *cfg,
+                                          const M68KInstr *call);
+
 /* True if `call` is a JSR/BSR to a configured inline-data callee
  * ([functions].inline_data_callees): the bytes after the call are a data block
  * whose first word is its length in bytes (that word included), and the

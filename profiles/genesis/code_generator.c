@@ -2599,9 +2599,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * when it is code, is a separate dispatch entry reached later via the
          * object's restored code pointer, not by linear fall-through). Without
          * this the recompiled caller runs ret_addr a frame early, corrupting
-         * the object's state machine (e.g. the AIZ MonkeyDude body). */
-        if (instr->has_target &&
-            function_finder_pops_return_unconditionally(rom, instr->target_addr)) {
+         * the object's state machine (e.g. the AIZ MonkeyDude body). An
+         * inline-data callee that pops its return only to read its block is
+         * not this idiom (function_finder_call_captures_return). */
+        if (function_finder_call_captures_return(rom, s_cfg_for_inline, instr)) {
             fprintf(f, "  recomp_push_return(0x%06Xu); /* JSR push (callee captures return) */\n",
                     ret_addr);
             fprintf(f, "  { int _saved_split_sp_popped = g_split_sp_popped; g_split_sp_popped = 0;\n");
@@ -5331,8 +5332,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                  * through to the next instruction — treat it as a terminator
                  * here to suppress the boundary tail call. */
                 if (!is_terminator && m68k_is_call(&last_instr) &&
-                    last_instr.has_target &&
-                    function_finder_pops_return_unconditionally(rom, last_instr.target_addr))
+                    function_finder_call_captures_return(rom, s_cfg_for_inline, &last_instr))
                     is_terminator = true;
                 if (!is_terminator) {
                     uint32_t fall_through = last_pc + last_instr.byte_length;
