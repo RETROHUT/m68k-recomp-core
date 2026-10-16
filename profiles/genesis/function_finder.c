@@ -656,6 +656,23 @@ bool function_finder_pops_return_unconditionally(const GenesisRom *rom, uint32_t
     return m68k_return_capture_is_unconditional(rom, start);
 }
 
+/* An inline-data call whose block resolves: the bytes after it are data and
+ * the callee resumes past them, whatever it does with its return address. */
+static bool is_resolved_inline_data_call(const GenesisRom *rom,
+                                         const GameConfig *cfg,
+                                         const M68KInstr *call) {
+    uint32_t cont;
+    return function_finder_inline_data_continuation(rom, cfg, call, &cont);
+}
+
+bool function_finder_call_captures_return(const GenesisRom *rom,
+                                          const GameConfig *cfg,
+                                          const M68KInstr *call) {
+    return call->has_target &&
+           m68k_return_capture_is_unconditional(rom, call->target_addr) &&
+           !is_resolved_inline_data_call(rom, cfg, call);
+}
+
 bool function_finder_inline_data_continuation(const GenesisRom *rom,
                                               const GameConfig *cfg,
                                               const M68KInstr *call,
@@ -775,15 +792,18 @@ void function_finder_run(const GenesisRom *rom, FunctionList *list,
                 /* If the callee captures its return address off the stack and
                  * repurposes it as a code pointer (Obj_WaitOffscreen idiom),
                  * the return address is a live dispatch entry — register it.
-                 * add_function code-gates it, so data return addresses (e.g.
-                 * inline-parameter callees) are rejected. */
+                 * add_function code-gates it, but an inline-parameter block can
+                 * still decode as code, so a resolved inline-data call is
+                 * skipped outright (NHL 96's $01BE78 block became a bogus
+                 * function and ended its caller early). */
                 /* This semantic edge is equally valid during the audited
                  * late-root phase. Late roots deliberately disable speculative
                  * table discovery, but a direct call to a return-capturing
                  * helper proves that its continuation is a future indirect
                  * entry. Keeping this phase-gated made state machines rooted
                  * via late_extra lose their next-state entries. */
-                if (function_captures_return_addr(rom, instr.target_addr))
+                if (function_captures_return_addr(rom, instr.target_addr) &&
+                        !is_resolved_inline_data_call(rom, cfg, &instr))
                     add_function(list, pc + instr.byte_length);
             }
 
